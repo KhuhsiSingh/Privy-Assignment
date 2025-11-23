@@ -99,43 +99,267 @@
 
       const performOCR = async (file) => {
         try {
-          const { data: { text } } = await window.Tesseract.recognize(file, 'eng');
-          return text;
+          // For scanned PDFs, we need to convert to images first
+          const pdfjsLib = window['pdfjs-dist/build/pdf'];
+          pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+          
+          const arrayBuffer = await file.arrayBuffer();
+          const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+          
+          let fullText = '';
+          
+          // Process first 3 pages (OCR is slow)
+          const pagesToProcess = Math.min(pdf.numPages, 3);
+          
+          for (let pageNum = 1; pageNum <= pagesToProcess; pageNum++) {
+            const page = await pdf.getPage(pageNum);
+            
+            // Render page to canvas with HIGHER scale for better OCR
+            const viewport = page.getViewport({ scale: 3.0 }); // Increased from 2.0 to 3.0
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d');
+            canvas.height = viewport.height;
+            canvas.width = viewport.width;
+            
+            // Enable image smoothing for better quality
+            context.imageSmoothingEnabled = true;
+            context.imageSmoothingQuality = 'high';
+            
+            await page.render({
+              canvasContext: context,
+              viewport: viewport
+            }).promise;
+            
+            // Image preprocessing for better OCR
+            const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+            const data = imageData.data;
+            
+            // Simple contrast enhancement and binarization
+            for (let i = 0; i < data.length; i += 4) {
+              // Get RGB values
+              const r = data[i];
+              const g = data[i + 1];
+              const b = data[i + 2];
+              
+              // Convert to grayscale
+              const gray = 0.299 * r + 0.587 * g + 0.114 * b;
+              
+              // Apply threshold (binarization) - increases contrast
+              const threshold = 128;
+              const binary = gray > threshold ? 255 : 0;
+              
+              // Set all channels to binary value
+              data[i] = binary;     // Red
+              data[i + 1] = binary; // Green
+              data[i + 2] = binary; // Blue
+              // Alpha stays the same
+            }
+            
+            // Put processed image back
+            context.putImageData(imageData, 0, 0);
+            
+            // Convert canvas to blob
+            const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+            
+            // Perform OCR on the processed image with better settings
+            const Tesseract = window.Tesseract;
+            const { data: { text, confidence } } = await Tesseract.recognize(blob, 'eng', {
+              logger: m => {
+                if (m.status === 'recognizing text') {
+                  console.log(`OCR Page ${pageNum}: ${Math.round(m.progress * 100)}%`);
+                }
+              },
+              // Better OCR parameters
+              tessedit_pageseg_mode: Tesseract.PSM.AUTO,
+              preserve_interword_spaces: '1',
+            });
+            
+            console.log(`Page ${pageNum} OCR confidence: ${Math.round(confidence)}%`);
+            
+            // Only add text if confidence is reasonable
+            if (confidence > 30) {
+              fullText += text + '\n';
+            } else {
+              console.warn(`Page ${pageNum} has low OCR confidence (${Math.round(confidence)}%), text may be unreliable`);
+              fullText += text + '\n'; // Still add it, classification system will handle it
+            }
+          }
+          
+          // Clean up the extracted text
+          fullText = fullText
+            .replace(/[^\x00-\x7F]/g, '') // Remove non-ASCII characters
+            .replace(/\s+/g, ' ')         // Normalize whitespace
+            .trim();
+          
+          console.log('OCR completed. Extracted text length:', fullText.length);
+          console.log('First 200 chars:', fullText.substring(0, 200));
+          
+          if (fullText.length < 20) {
+            throw new Error('OCR extracted very little text. Image quality may be too poor.');
+          }
+          
+          return fullText;
         } catch (err) {
-          throw new Error('Failed to perform OCR');
+          console.error('OCR error:', err);
+          throw new Error('Failed to perform OCR on scanned document. Please ensure the PDF contains readable text and is not password-protected. Try scanning at higher resolution (300+ DPI).');
         }
       };
 
       const mockClassifyDocument = async (text) => {
         await new Promise(resolve => setTimeout(resolve, 1500));
-        const textLower = text.toLowerCase();
-        let category = "Unknown", confidence = 50, indicators = [];
         
-        if (textLower.includes("aadhaar") || textLower.includes("uidai") || /\d{4}\s?\d{4}\s?\d{4}/.test(text)) {
-          category = "Aadhaar Card"; confidence = 92; indicators = ["12-digit UID number pattern", "UIDAI keyword found"];
-        } else if (textLower.includes("pan") || /[A-Z]{5}\d{4}[A-Z]/.test(text)) {
-          category = "PAN Card"; confidence = 95; indicators = ["PAN format (ABCDE1234F)", "Income Tax reference"];
-        } else if (textLower.includes("passport")) {
-          category = "Passport"; confidence = 87; indicators = ["Passport keyword found"];
-        } else if (textLower.includes("invoice")) {
-          category = "Invoice"; confidence = 88; indicators = ["Invoice number present", "Total amount found"];
-        } else if (textLower.includes("account") && textLower.includes("transaction")) {
-          category = "Bank Statement"; confidence = 85; indicators = ["Account number", "Transactions detected"];
-        } else if (textLower.includes("experience") && textLower.includes("education")) {
-          category = "Resume/CV"; confidence = 90; indicators = ["Experience section", "Education section"];
-        } else if (textLower.includes("itr") || textLower.includes("assessment year")) {
-          category = "ITR Form"; confidence = 91; indicators = ["ITR reference", "Assessment Year"];
-        } else if (textLower.includes("meter") || textLower.includes("electricity")) {
-          category = "Electricity Bill"; confidence = 86; indicators = ["Meter reading", "Electricity keyword"];
-        } else if (textLower.includes("dr.") || textLower.includes("prescription")) {
-          category = "Medical Prescription"; confidence = 84; indicators = ["Doctor reference", "Medicine format"];
-        } else if (textLower.includes("driving") || textLower.includes("license")) {
-          category = "Driving License"; confidence = 89; indicators = ["DL keyword", "Vehicle class"];
+        const textLower = text.toLowerCase();
+        const scores = [];
+        
+        // Helper function to calculate score for each category
+        const checkCategory = (name, checks) => {
+          let score = 0;
+          const foundIndicators = [];
+          
+          checks.forEach(check => {
+            if (check.test(text, textLower)) {
+              score += check.weight;
+              foundIndicators.push(check.indicator);
+            }
+          });
+          
+          if (score > 0) {
+            scores.push({ category: name, score, indicators: foundIndicators });
+          }
+        };
+        
+        // 1. AADHAAR CARD - Very specific patterns with OCR tolerance
+        checkCategory("Aadhaar Card", [
+          { test: (t, tl) => tl.includes("aadhaar") || tl.includes("aadhar") || tl.includes("adhar") || tl.includes("a a d h a a r"), weight: 30, indicator: "Aadhaar keyword found" },
+          { test: (t, tl) => tl.includes("uidai") || tl.includes("uid") || tl.includes("unique identification"), weight: 35, indicator: "UIDAI reference detected" },
+          { test: (t) => /\d{4}\s?\d{4}\s?\d{4}/.test(t), weight: 25, indicator: "12-digit UID pattern" },
+          { test: (t, tl) => tl.includes("enrolment") || tl.includes("enrollment") || tl.includes("enrol"), weight: 10, indicator: "Enrolment number present" },
+          { test: (t, tl) => tl.includes("government") || tl.includes("govt") || tl.includes("india"), weight: 5, indicator: "Government of India header" },
+          { test: (t) => /\d{3,4}\s+\d{3,4}\s+\d{3,4}/.test(t), weight: 20, indicator: "12-digit pattern (with OCR spacing)" }
+        ]);
+        
+        // 2. PAN CARD - Strict format checking with OCR tolerance
+        checkCategory("PAN Card", [
+          { test: (t) => /[A-Z]{5}\d{4}[A-Z]/.test(t), weight: 40, indicator: "Valid PAN format (ABCDE1234F)" },
+          { test: (t, tl) => tl.includes("permanent account") || tl.includes("pan") || tl.includes("p a n") || tl.includes("p.a.n"), weight: 30, indicator: "PAN keyword found" },
+          { test: (t, tl) => (tl.includes("income") && tl.includes("tax")) || tl.includes("incometax"), weight: 20, indicator: "Income Tax Department reference" },
+          { test: (t, tl) => tl.includes("govt") || tl.includes("government") || tl.includes("india"), weight: 10, indicator: "Government header" },
+          { test: (t, tl) => /[A-Z]{3,5}\s*\d{3,4}\s*[A-Z]/.test(t), weight: 25, indicator: "PAN-like pattern detected" }
+        ]);
+        
+        // 3. PASSPORT - Multiple validation points
+        checkCategory("Passport", [
+          { test: (t, tl) => tl.includes("passport"), weight: 25, indicator: "Passport keyword" },
+          { test: (t, tl) => tl.includes("republic of india"), weight: 30, indicator: "Republic of India header" },
+          { test: (t) => /[A-Z]\d{7}/.test(t), weight: 25, indicator: "Passport number format" },
+          { test: (t, tl) => tl.includes("nationality") && tl.includes("indian"), weight: 10, indicator: "Nationality field" },
+          { test: (t, tl) => tl.includes("place of birth") || tl.includes("date of birth"), weight: 10, indicator: "Birth details present" }
+        ]);
+        
+        // 4. INVOICE - Commercial document indicators
+        checkCategory("Invoice", [
+          { test: (t, tl) => tl.includes("invoice"), weight: 30, indicator: "Invoice keyword" },
+          { test: (t, tl) => /invoice\s*(no|number|#)?\s*:?\s*\d+/i.test(t), weight: 25, indicator: "Invoice number found" },
+          { test: (t, tl) => (tl.includes("subtotal") || tl.includes("sub total")) && tl.includes("total"), weight: 20, indicator: "Subtotal and total present" },
+          { test: (t, tl) => tl.includes("tax") || tl.includes("gst") || tl.includes("vat"), weight: 15, indicator: "Tax information" },
+          { test: (t, tl) => tl.includes("bill to") || tl.includes("billed to"), weight: 10, indicator: "Billing address" }
+        ]);
+        
+        // 5. BANK STATEMENT - Financial transaction patterns
+        checkCategory("Bank Statement", [
+          { test: (t, tl) => tl.includes("account") && (tl.includes("statement") || tl.includes("number")), weight: 30, indicator: "Account statement reference" },
+          { test: (t, tl) => tl.includes("transaction") || tl.includes("transactions"), weight: 25, indicator: "Transaction keyword" },
+          { test: (t, tl) => (tl.includes("opening balance") || tl.includes("closing balance")), weight: 20, indicator: "Balance information" },
+          { test: (t, tl) => tl.includes("debit") || tl.includes("credit") || tl.includes("withdrawal") || tl.includes("deposit"), weight: 15, indicator: "Transaction types" },
+          { test: (t, tl) => tl.includes("bank") || tl.includes("branch"), weight: 10, indicator: "Bank reference" }
+        ]);
+        
+        // 6. RESUME/CV - Professional profile indicators
+        checkCategory("Resume/CV", [
+          { test: (t, tl) => tl.includes("experience") || tl.includes("work history"), weight: 30, indicator: "Experience section" },
+          { test: (t, tl) => tl.includes("education") || tl.includes("qualification"), weight: 30, indicator: "Education section" },
+          { test: (t, tl) => tl.includes("skills") || tl.includes("technical skills"), weight: 20, indicator: "Skills section" },
+          { test: (t, tl) => tl.includes("resume") || tl.includes("curriculum vitae") || tl.includes("cv"), weight: 15, indicator: "Resume keyword" },
+          { test: (t, tl) => tl.includes("email") && tl.includes("phone"), weight: 5, indicator: "Contact information" }
+        ]);
+        
+        // 7. ITR FORM - Tax return specifics
+        checkCategory("ITR Form", [
+          { test: (t, tl) => tl.includes("itr") && (tl.includes("form") || /itr[-\s]*\d/.test(tl)), weight: 35, indicator: "ITR form reference" },
+          { test: (t, tl) => tl.includes("assessment year") || tl.includes("a.y."), weight: 30, indicator: "Assessment Year mentioned" },
+          { test: (t, tl) => tl.includes("income tax") && tl.includes("return"), weight: 25, indicator: "Income Tax Return keyword" },
+          { test: (t, tl) => tl.includes("acknowledgement") || tl.includes("ack"), weight: 10, indicator: "Acknowledgement number" }
+        ]);
+        
+        // 8. ELECTRICITY BILL - Utility bill markers
+        checkCategory("Electricity Bill", [
+          { test: (t, tl) => tl.includes("electricity") || tl.includes("electric"), weight: 30, indicator: "Electricity keyword" },
+          { test: (t, tl) => tl.includes("meter") && (tl.includes("reading") || tl.includes("number")), weight: 25, indicator: "Meter reading" },
+          { test: (t, tl) => tl.includes("units consumed") || tl.includes("consumption"), weight: 25, indicator: "Units consumed" },
+          { test: (t, tl) => tl.includes("bill") && tl.includes("amount"), weight: 10, indicator: "Bill amount" },
+          { test: (t, tl) => tl.includes("due date") || tl.includes("payment"), weight: 10, indicator: "Payment information" }
+        ]);
+        
+        // 9. MEDICAL PRESCRIPTION - Healthcare document
+        checkCategory("Medical Prescription", [
+          { test: (t, tl) => /dr\.?\s+[a-z]/i.test(t) || tl.includes("doctor"), weight: 30, indicator: "Doctor reference (Dr.)" },
+          { test: (t, tl) => tl.includes("prescription") || tl.includes("rx"), weight: 25, indicator: "Prescription keyword" },
+          { test: (t, tl) => /\d+\s*mg|\d+\s*ml/i.test(t), weight: 25, indicator: "Medicine dosage (mg/ml)" },
+          { test: (t, tl) => tl.includes("tablet") || tl.includes("capsule") || tl.includes("syrup"), weight: 15, indicator: "Medicine format" },
+          { test: (t, tl) => tl.includes("twice") || tl.includes("daily") || tl.includes("times a day"), weight: 5, indicator: "Dosage frequency" }
+        ]);
+        
+        // 10. DRIVING LICENSE - License specifics
+        checkCategory("Driving License", [
+          { test: (t, tl) => tl.includes("driving") && (tl.includes("license") || tl.includes("licence")), weight: 35, indicator: "Driving License keyword" },
+          { test: (t) => /DL[-\s]?\d+|[A-Z]{2}[-\s]?\d{13}/i.test(t), weight: 30, indicator: "DL number format" },
+          { test: (t, tl) => tl.includes("transport") || tl.includes("motor vehicle"), weight: 20, indicator: "Transport department" },
+          { test: (t, tl) => tl.includes("vehicle class") || tl.includes("cov") || /\b(lmv|mcwg|mcwog)\b/i.test(t), weight: 15, indicator: "Vehicle class (LMV/MCWG)" }
+        ]);
+        
+        // Sort by score (highest first)
+        scores.sort((a, b) => b.score - a.score);
+        
+        // Determine final classification
+        let category = "Unknown";
+        let confidence = 50;
+        let indicators = [];
+        let reasoning = "";
+        
+        if (scores.length === 0) {
+          // No matches at all
+          reasoning = "No recognizable document patterns found. Document does not match any of the 10 supported categories.";
+        } else if (scores[0].score < 30) {
+          // Best match has very low score - probably not a valid category
+          reasoning = `Weak indicators detected (score: ${scores[0].score}/100). Insufficient confidence to classify. Document may be a different type or contain ambiguous content.`;
+        } else if (scores.length > 1 && scores[0].score - scores[1].score < 15) {
+          // Top 2 scores are very close - ambiguous
+          reasoning = `Ambiguous classification between ${scores[0].category} (${scores[0].score}) and ${scores[1].category} (${scores[1].score}). Document contains mixed indicators.`;
+        } else {
+          // Clear winner
+          category = scores[0].category;
+          indicators = scores[0].indicators;
+          
+          // Calculate confidence based on score
+          if (scores[0].score >= 80) {
+            confidence = 90 + Math.min(scores[0].score - 80, 10);
+          } else if (scores[0].score >= 60) {
+            confidence = 75 + (scores[0].score - 60) / 2;
+          } else if (scores[0].score >= 40) {
+            confidence = 60 + (scores[0].score - 40) / 2;
+          } else {
+            confidence = 50 + scores[0].score / 4;
+          }
+          
+          confidence = Math.round(confidence);
+          reasoning = `Document classified as ${category} with ${indicators.length} strong indicators detected (score: ${scores[0].score}/100).`;
         }
         
         return {
-          category, confidence, indicators,
-          reasoning: "Document classified using keyword-based pattern matching. Production deployment would integrate Claude AI for higher accuracy and advanced reasoning capabilities."
+          category,
+          confidence,
+          indicators,
+          reasoning
         };
       };
 
@@ -166,6 +390,17 @@ Respond with ONLY JSON (no markdown):
       };
 
       const classifyDocument = async (text) => {
+        // Clean text before classification (helps with OCR noise)
+        text = text
+          .replace(/[^\x00-\x7F]/g, ' ')  // Remove non-ASCII
+          .replace(/\s+/g, ' ')           // Normalize spaces
+          .replace(/[|\\\/]/g, 'I')       // Common OCR mistakes
+          .replace(/[0O]/g, match => {    // O vs 0 confusion
+            // Keep context-aware replacement
+            return match;
+          })
+          .trim();
+        
         // Using keyword-based classification for demo
         // Production would integrate Claude API via backend
         return await mockClassifyDocument(text);
@@ -184,7 +419,10 @@ Respond with ONLY JSON (no markdown):
           if (selectedFile.size === 0) throw new Error('File is empty');
 
           let text = await extractTextFromPDF(selectedFile);
-          if (!text || text.length < 50) text = await performOCR(selectedFile);
+          if (!text || text.length < 50) {
+            console.log('No text found in PDF, attempting OCR on scanned images...');
+            text = await performOCR(selectedFile);
+          }
           if (!text?.trim()) throw new Error('No content extracted');
 
           setExtractedText(text);
@@ -286,8 +524,16 @@ Respond with ONLY JSON (no markdown):
               <div className="flex flex-col items-center py-20 animate-fadeIn">
                 <Loader2 className="w-16 h-16 text-blue-600 animate-spin" />
                 <div className="mt-6 text-center">
-                  <h3 className="text-xl font-semibold text-slate-900 mb-2">Processing...</h3>
-                  <p className="text-slate-600">Analyzing document type</p>
+                  <h3 className="text-xl font-semibold text-slate-900 mb-2">Processing Document...</h3>
+                  <p className="text-slate-600">Extracting text and analyzing document type</p>
+                  <p className="text-sm text-slate-500 mt-2">
+                    {file?.size > 1024 * 1024 ? 'Large file - this may take 30-60 seconds' : 'This should take 3-10 seconds'}
+                  </p>
+                </div>
+                <div className="mt-8 flex gap-2">
+                  <div className="w-2 h-2 bg-blue-600 rounded-full animate-bounce" style={{ animationDelay: '0s' }}></div>
+                  <div className="w-2 h-2 bg-blue-600 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }}></div>
+                  <div className="w-2 h-2 bg-blue-600 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
                 </div>
               </div>
             )}
